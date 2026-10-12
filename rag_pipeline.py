@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from openai import OpenAI
-
 import os
+import re
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 
 import rank_bm25
-
-import re
-
-from pathlib import Path
+from openai import OpenAI
 
 # Цена в курсе: 0,1 ₽ за 1000 токенов (вход + выход).
 PRICE_PER_1K_RUB = 0.1
@@ -106,11 +104,11 @@ PROMPT = """<CONTEXT>
 {question}
 </QUESTION>"""
 
+
 @dataclass
 class Document:
     name: str
     relative_path: str
-    content: str
     chunks: list[str]
 
 
@@ -141,33 +139,58 @@ def query_tokens(question: str) -> list[str]:
     return without_stopwords or tokens
 
 
+@dataclass
+class SearchIndex:
+    corpus: list[tuple[Document, str]]
+    metadata_tokens: list[set[str]]
+    bm25: rank_bm25.BM25Okapi | None
+
+
+def build_search_index(documents: list[Document]) -> SearchIndex:
+    corpus = [
+        (document, chunk)
+        for document in documents
+        for chunk in document.chunks
+    ]
+    tokenized = [tokenize(chunk) for _, chunk in corpus]
+
+    bm25 = rank_bm25.BM25Okapi(tokenized) if any(tokenized) else None
+    metadata_tokens = [
+        set(tokenize(f'{document.relative_path} {document.name}'))
+        for document, _ in corpus
+    ]
+    return SearchIndex(corpus, metadata_tokens, bm25)
+
+
+@lru_cache(maxsize=1)
+def get_search_index(docs_dir: Path) -> SearchIndex:
+    return build_search_index(indexation(docs_dir))
+
+
 def retrieve_top_chunks(
     question: str,
-    documents: list[Document],
+    index: SearchIndex,
     top_k: int = 3,
     metadata_bonus: float = 2.0,
 ) -> list[RetrievedChunk]:
     if top_k <= 0:
         return []
 
-    # Разворачиваем документы в корпус BM25, сохраняя метаданные каждого чанка.
-    corpus: list[tuple[Document, str]] = [
-        (document, chunk)
-        for document in documents
-        for chunk in document.chunks
-    ]
-    if not corpus:
+    if not index.corpus:
         return []
 
     tokens = query_tokens(question)
-    bm25 = rank_bm25.BM25Okapi([tokenize(chunk) for _, chunk in corpus])
-    bm25_scores = bm25.get_scores(tokens)
+    bm25_scores = (
+        index.bm25.get_scores(tokens)
+        if index.bm25 is not None else [0.0] * len(index.corpus)
+    )
     unique_query_tokens = set(tokens)
 
     candidates: list[RetrievedChunk] = []
-    for (document, chunk), bm25_score in zip(corpus, bm25_scores):
+    for (document, chunk), metadata_tokens, bm25_score in zip(
+        index.corpus, index.metadata_tokens, bm25_scores
+    ):
         path = str(document.relative_path)
-        metadata_tokens = set(tokenize(f'{path} {document.name}'))
         bonus = metadata_bonus * len(unique_query_tokens & metadata_tokens)
         candidates.append(
             RetrievedChunk(
@@ -178,7 +201,6 @@ def retrieve_top_chunks(
             )
         )
 
-    # sorted стабилен, поэтому при одинаковых score сохраняется порядок корпуса.
     candidates.sort(key=lambda candidate: candidate.score, reverse=True)
 
     selected: list[RetrievedChunk] = []
@@ -195,15 +217,22 @@ def retrieve_top_chunks(
 
 
 def split_into_chunks(text: str, chunk_size: int = 4000) -> list[str]:
-    # Разбиваем текст по пустым строкам
-    paragraphs = re.split(r"\n\s*\n", text.strip())
+    if chunk_size <= 0:
+        raise ValueError('chunk_size должен быть положительным')
+    if not text.strip():
+        return []
+
+    # Сохраняем исходные разделители и отступы, включая блоки кода Markdown.
+    parts = re.split(r'(\r?\n[ \t]*\r?\n)', text)
+    paragraphs = [
+        parts[i] + (parts[i + 1] if i + 1 < len(parts) else '')
+        for i in range(0, len(parts), 2)
+    ]
 
     chunks = []
     current_chunk = ""
 
     for paragraph in paragraphs:
-        paragraph = paragraph.strip()
-
         if not paragraph:
             continue
 
@@ -224,10 +253,8 @@ def split_into_chunks(text: str, chunk_size: int = 4000) -> list[str]:
             continue
 
         # Проверяем, помещается ли абзац в текущий чанк
-        separator = "\n\n" if current_chunk else ""
-
-        if len(current_chunk) + len(separator) + len(paragraph) <= chunk_size:
-            current_chunk += separator + paragraph
+        if len(current_chunk) + len(paragraph) <= chunk_size:
+            current_chunk += paragraph
         else:
             chunks.append(current_chunk)
             current_chunk = paragraph
@@ -239,30 +266,21 @@ def split_into_chunks(text: str, chunk_size: int = 4000) -> list[str]:
 
 
 def indexation(docs_dir: Path = DEFAULT_DOCS_DIR) -> list[Document]:
+    if not docs_dir.is_dir():
+        raise FileNotFoundError(f'Каталог документации не найден: {docs_dir}')
     documents = []
-    for file in docs_dir.rglob('*.md'):
-
-        with file.open("r", encoding="utf-8") as f:
-            for line in f:
-                if not line.startswith("# "):
-                    continue
-
-                title = line
-                break
-            else:
-                print(f"No title found in {file}")
-        
-        title = normalize(title.removeprefix("# ").strip())
-
-        content = normalize(file.read_text(encoding="utf-8"))
-        relative_path = file.relative_to(docs_dir)
-        # print(f"Path: {relative_path}")
-
+    for file in sorted(docs_dir.rglob('*.md')):
+        content = file.read_text(encoding='utf-8')
+        title = next(
+            (line.removeprefix('# ').strip()
+             for line in content.splitlines() if line.startswith('# ') and line[2:].strip()),
+            file.stem,
+        )
+        relative_path = file.relative_to(docs_dir).as_posix()
         documents.append(
             Document(
                 name=title,
                 relative_path=relative_path,
-                content=content,
                 chunks=split_into_chunks(content)
                 )
             )
@@ -278,7 +296,7 @@ def augmentation(question: str, retrieve_chunks: list[RetrievedChunk]) -> str:
     return PROMPT.format(context=context, question=question)
 
 
-def LLMCall(prompt: str) -> dict:
+def llm_call(prompt: str) -> dict:
     api_key = os.getenv('LLM_API_KEY', '')
     base_url = os.getenv('LLM_BASE_URL', 'https://llm.api.cloud.yandex.net/v1')
     model = os.getenv('LLM_MODEL', '')
@@ -294,7 +312,6 @@ def LLMCall(prompt: str) -> dict:
         temperature=0,
         max_tokens=1500,
     )
-    print(response)
 
     answer = response.choices[0].message.content or ''
 
@@ -308,9 +325,8 @@ def LLMCall(prompt: str) -> dict:
 
     return {
         'answer': answer,
-        'sources': 'sources', 
         'cost_rub': cost_rub,
-    } 
+    }
 
 
 def ask(question: str) -> dict:
@@ -322,16 +338,16 @@ def ask(question: str) -> dict:
     - sources: list[str] — список путей файлов источников (до 3)
     - cost_rub: float — стоимость запроса в рублях
     """
-    # TODO: Реализуйте RAG pipeline:
-    # 1. Indexing: прочитать и разбить документы на фрагменты
-    # 2. Retrieval: найти top-3 релевантных фрагмента (BM25 + бонус за метаданные)
-    # 3. Augmentation: собрать промпт с контекстом
-    # 4. Generation: вызвать модель и вернуть результат
-    # raise NotImplementedError('Реализуйте функцию ask')
-    docs = indexation()
-    chunks = retrieve_top_chunks(question, docs)
+    index = get_search_index(DEFAULT_DOCS_DIR.resolve())
+    chunks = retrieve_top_chunks(question, index)
     prompt = augmentation(question, chunks)
-    print(LLMCall(prompt))
+    result = llm_call(prompt)
+    return {
+        'answer': result['answer'],
+        'sources': [chunk.path for chunk in chunks],
+        'cost_rub': result['cost_rub'],
+    }
 
 
-ask("Отчет география")
+if __name__ == '__main__':
+    print(ask('Отчет география'))
