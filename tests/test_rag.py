@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 try:
     import sys
-    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(ROOT / 'src'))
     from rag_pipeline import GOLDEN_QA, ask
 except ImportError as e:
     pytest.skip(f'Нет модуля rag_pipeline: {e}', allow_module_level=True)
