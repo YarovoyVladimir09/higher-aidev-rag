@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from openai import OpenAI
 
 import os
 
@@ -89,6 +90,21 @@ GOLDEN_QA = [
     },
 ]
 
+SYSTEM_PROMPT = """<SYSTEM_INSTRUCTION>
+Отвечай на вопрос только на основе данных из блока CONTEXT.
+Если в контексте нет нужных данных, честно сообщи об этом и ничего не выдумывай.
+В ответе явно указывай path использованных источников.
+</SYSTEM_INSTRUCTION>
+"""
+
+
+PROMPT = """<CONTEXT>
+{context}
+</CONTEXT>
+
+<QUESTION>
+{question}
+</QUESTION>"""
 
 @dataclass
 class Document:
@@ -98,8 +114,84 @@ class Document:
     chunks: list[str]
 
 
+@dataclass(frozen=True)
+class RetrievedChunk:
+    """Фрагмент, отобранный retrieval-этапом для передачи в prompt."""
+
+    path: str
+    title: str
+    text: str
+    score: float
+
+
+TOKEN_RE = re.compile(r'[A-Za-zА-Яа-я0-9_]+')
+
+
 def normalize(text: str) -> str:
     return text.lower().replace("ё", "е")
+
+
+def tokenize(text: str) -> list[str]:
+    return TOKEN_RE.findall(normalize(text))
+
+
+def query_tokens(question: str) -> list[str]:
+    tokens = tokenize(question)
+    without_stopwords = [token for token in tokens if token not in QUERY_STOPWORDS]
+    return without_stopwords or tokens
+
+
+def retrieve_top_chunks(
+    question: str,
+    documents: list[Document],
+    top_k: int = 3,
+    metadata_bonus: float = 2.0,
+) -> list[RetrievedChunk]:
+    if top_k <= 0:
+        return []
+
+    # Разворачиваем документы в корпус BM25, сохраняя метаданные каждого чанка.
+    corpus: list[tuple[Document, str]] = [
+        (document, chunk)
+        for document in documents
+        for chunk in document.chunks
+    ]
+    if not corpus:
+        return []
+
+    tokens = query_tokens(question)
+    bm25 = rank_bm25.BM25Okapi([tokenize(chunk) for _, chunk in corpus])
+    bm25_scores = bm25.get_scores(tokens)
+    unique_query_tokens = set(tokens)
+
+    candidates: list[RetrievedChunk] = []
+    for (document, chunk), bm25_score in zip(corpus, bm25_scores):
+        path = str(document.relative_path)
+        metadata_tokens = set(tokenize(f'{path} {document.name}'))
+        bonus = metadata_bonus * len(unique_query_tokens & metadata_tokens)
+        candidates.append(
+            RetrievedChunk(
+                path=path,
+                title=document.name,
+                text=chunk,
+                score=float(bm25_score + bonus),
+            )
+        )
+
+    # sorted стабилен, поэтому при одинаковых score сохраняется порядок корпуса.
+    candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+
+    selected: list[RetrievedChunk] = []
+    selected_paths: set[str] = set()
+    for candidate in candidates:
+        if candidate.path in selected_paths:
+            continue
+        selected.append(candidate)
+        selected_paths.add(candidate.path)
+        if len(selected) == top_k:
+            break
+
+    return selected
 
 
 def split_into_chunks(text: str, chunk_size: int = 4000) -> list[str]:
@@ -178,6 +270,49 @@ def indexation(docs_dir: Path = DEFAULT_DOCS_DIR) -> list[Document]:
     return documents
 
 
+def augmentation(question: str, retrieve_chunks: list[RetrievedChunk]) -> str:
+    context = "\n\n".join(
+        f'[{number}]\npath={chunk.path}\n{chunk.text}'
+        for number, chunk in enumerate(retrieve_chunks, start=1)
+    )
+    return PROMPT.format(context=context, question=question)
+
+
+def LLMCall(prompt: str) -> dict:
+    api_key = os.getenv('LLM_API_KEY', '')
+    base_url = os.getenv('LLM_BASE_URL', 'https://llm.api.cloud.yandex.net/v1')
+    model = os.getenv('LLM_MODEL', '')
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {'role': 'system', 'content': SYSTEM_PROMPT},
+            {'role': 'user', 'content': prompt}
+        ],
+        temperature=0,
+        max_tokens=1500,
+    )
+    print(response)
+
+    answer = response.choices[0].message.content or ''
+
+    usage = response.usage
+    prompt_tokens = usage.prompt_tokens if usage else 0
+    completion_tokens = usage.completion_tokens if usage else 0
+    cost_rub = round(
+        (prompt_tokens + completion_tokens) / 1000 * PRICE_PER_1K_RUB,
+        4
+    )
+
+    return {
+        'answer': answer,
+        'sources': 'sources', 
+        'cost_rub': cost_rub,
+    } 
+
+
 def ask(question: str) -> dict:
     """
     Отвечает на вопрос по документации Яндекс Метрики.
@@ -192,9 +327,11 @@ def ask(question: str) -> dict:
     # 2. Retrieval: найти top-3 релевантных фрагмента (BM25 + бонус за метаданные)
     # 3. Augmentation: собрать промпт с контекстом
     # 4. Generation: вызвать модель и вернуть результат
-    raise NotImplementedError('Реализуйте функцию ask')
+    # raise NotImplementedError('Реализуйте функцию ask')
+    docs = indexation()
+    chunks = retrieve_top_chunks(question, docs)
+    prompt = augmentation(question, chunks)
+    print(LLMCall(prompt))
 
 
-indx = indexation()
-print("\n".join(sorted(doc.name for doc in indx)))
-
+ask("Отчет география")
