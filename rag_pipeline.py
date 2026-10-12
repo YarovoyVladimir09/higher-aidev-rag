@@ -4,15 +4,24 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
 import rank_bm25
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    OpenAI,
+    RateLimitError,
+)
 
 # Цена в курсе: 0,1 ₽ за 1000 токенов (вход + выход).
 PRICE_PER_1K_RUB = 0.1
+MAX_LLM_ATTEMPTS = 2
+RETRY_DELAY_SECONDS = 0.5
 
 # Путь до выгрузки документации Яндекс Метрики
 DEFAULT_DOCS_DIR = Path('metrica-docs-snapshot/docs')
@@ -301,19 +310,40 @@ def llm_call(prompt: str) -> dict:
     base_url = os.getenv('LLM_BASE_URL', 'https://llm.api.cloud.yandex.net/v1')
     model = os.getenv('LLM_MODEL', '')
 
-    client = OpenAI(api_key=api_key, base_url=base_url)
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {'role': 'system', 'content': SYSTEM_PROMPT},
-            {'role': 'user', 'content': prompt}
-        ],
-        temperature=0,
-        max_tokens=1500,
+    client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+    retryable_errors = (
+        APIConnectionError,
+        APITimeoutError,
+        RateLimitError,
+        APIStatusError,
     )
 
-    answer = response.choices[0].message.content or ''
+    for attempt in range(MAX_LLM_ATTEMPTS):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {'role': 'system', 'content': SYSTEM_PROMPT},
+                    {'role': 'user', 'content': prompt},
+                ],
+                temperature=0,
+                max_tokens=1500,
+            )
+            answer = (
+                response.choices[0].message.content
+                if response.choices
+                else ''
+            ) or ''
+            if answer.strip():
+                break
+        except retryable_errors as error:
+            if isinstance(error, APIStatusError) and error.status_code < 500:
+                raise
+
+        if attempt < MAX_LLM_ATTEMPTS - 1:
+            time.sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
+    else:
+        raise RuntimeError('LLM не вернула непустой ответ после повторной попытки')
 
     usage = response.usage
     prompt_tokens = usage.prompt_tokens if usage else 0
